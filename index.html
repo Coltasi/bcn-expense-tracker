@@ -142,7 +142,27 @@ textarea { resize: vertical; min-height: 130px; font-size: 12px; font-family: 'C
 .preloaded-banner .pl-count { font-size: 28px; font-weight: 800; color: #059669; }
 @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 .animate-in { animation: slideIn 0.2s ease; }
+
+.upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+.drop-zone {
+  border: 2px dashed var(--border); border-radius: var(--radius); padding: 32px 16px;
+  text-align: center; cursor: pointer; transition: all 0.2s; background: var(--bg);
+  position: relative;
+}
+.drop-zone:hover, .drop-zone.dragover { border-color: var(--blue); background: #eff6ff; }
+.drop-zone.success { border-color: var(--success); border-style: solid; background: #ecfdf5; }
+.drop-zone.error { border-color: var(--danger); border-style: solid; background: #fef2f2; }
+.drop-zone input[type=file] { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+.drop-icon { font-size: 32px; margin-bottom: 8px; }
+.drop-label { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+.drop-sub { font-size: 12px; color: var(--muted); }
+.drop-status { font-size: 13px; font-weight: 600; margin-top: 8px; }
+.drop-zone.success .drop-status { color: var(--success); }
+.drop-zone.error .drop-status { color: var(--danger); }
+.spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid var(--border); border-top-color: var(--blue); border-radius: 50%; animation: spin 0.7s linear infinite; margin-bottom: 4px; }
+@keyframes spin { to { transform: rotate(360deg); } }
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 </head>
 <body>
 <div class="container">
@@ -416,54 +436,110 @@ function saveSetup() {
 }
 
 // ── IMPORT (for future months) ────────────────────────────────────────────────
-let activeTab = 'amex';
+// PDF.js worker
+if (typeof pdfjsLib !== 'undefined') {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+}
+
+// Extract text from PDF preserving line structure
+async function extractPDFText(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({data: arrayBuffer}).promise;
+  let fullText = '';
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    // Group items by Y position to reconstruct lines
+    const lineMap = {};
+    for (const item of content.items) {
+      if (!item.str) continue;
+      const y = Math.round(item.transform[5] / 4) * 4;
+      if (!lineMap[y]) lineMap[y] = [];
+      lineMap[y].push({ x: item.transform[4], str: item.str });
+    }
+    const ys = Object.keys(lineMap).map(Number).sort((a, b) => b - a);
+    for (const y of ys) {
+      const items = lineMap[y].sort((a, b) => a.x - b.x);
+      fullText += items.map(i => i.str).join(' ').trim() + '\n';
+    }
+    fullText += '\n';
+  }
+  return fullText;
+}
+
+async function handlePDFUpload(file, card) {
+  const zone = document.getElementById('zone-' + card);
+  if (!zone) return;
+  zone.className = 'drop-zone';
+  zone.querySelector('.drop-status').textContent = '';
+  zone.querySelector('.drop-icon').innerHTML = '<div class="spinner"></div>';
+  zone.querySelector('.drop-label').textContent = 'Reading PDF…';
+  try {
+    const text = await extractPDFText(file);
+    const txns = card === 'amex' ? parseAMEX(text) : parseCiti(text);
+    if (txns.length === 0) throw new Error('No transactions found — is this the right card?');
+    if (card === 'amex') S.amexText = text; else S.citiText = text;
+    zone.className = 'drop-zone success';
+    zone.querySelector('.drop-icon').textContent = '✅';
+    zone.querySelector('.drop-label').textContent = file.name;
+    zone.querySelector('.drop-sub').textContent = '';
+    zone.querySelector('.drop-status').textContent = txns.length + ' transactions found';
+  } catch (err) {
+    zone.className = 'drop-zone error';
+    zone.querySelector('.drop-icon').textContent = '❌';
+    zone.querySelector('.drop-label').textContent = 'Upload failed';
+    zone.querySelector('.drop-sub').textContent = '';
+    zone.querySelector('.drop-status').textContent = err.message;
+  }
+}
+
 function renderImport() {
   const amexCount = S.amexText ? parseAMEX(S.amexText).length : 0;
   const citiCount = S.citiText ? parseCiti(S.citiText).length : 0;
   return `
   <div class="card">
-    <div class="section-title">Paste Credit Card Statement Text</div>
-    <p style="color:var(--muted);font-size:13px;margin-bottom:16px;">
-      Open your PDF, press <span class="kbd">⌘A</span> to select all, <span class="kbd">⌘C</span> to copy, then paste below.
-    </p>
-    <div class="import-tabs">
-      <div class="import-tab ${activeTab==='amex'?'active':''}" onclick="setTab('amex')">💳 AMEX</div>
-      <div class="import-tab ${activeTab==='citi'?'active':''}" onclick="setTab('citi')">💳 Citi AAdvantage</div>
+    <div class="section-title">Upload Credit Card Statements</div>
+    <div class="upload-grid">
+      <div class="drop-zone ${amexCount?'success':''}" id="zone-amex"
+           ondragover="event.preventDefault();this.classList.add('dragover')"
+           ondragleave="this.classList.remove('dragover')"
+           ondrop="event.preventDefault();this.classList.remove('dragover');handlePDFUpload(event.dataTransfer.files[0],'amex')">
+        <input type="file" accept=".pdf" onchange="handlePDFUpload(this.files[0],'amex')">
+        <div class="drop-icon">${amexCount ? '✅' : '💳'}</div>
+        <div class="drop-label">${amexCount ? 'AMEX loaded' : 'AMEX Statement'}</div>
+        <div class="drop-sub">${amexCount ? '' : 'Drop PDF here or click to browse'}</div>
+        <div class="drop-status">${amexCount ? amexCount + ' transactions' : ''}</div>
+      </div>
+      <div class="drop-zone ${citiCount?'success':''}" id="zone-citi"
+           ondragover="event.preventDefault();this.classList.add('dragover')"
+           ondragleave="this.classList.remove('dragover')"
+           ondrop="event.preventDefault();this.classList.remove('dragover');handlePDFUpload(event.dataTransfer.files[0],'citi')">
+        <input type="file" accept=".pdf" onchange="handlePDFUpload(this.files[0],'citi')">
+        <div class="drop-icon">${citiCount ? '✅' : '💳'}</div>
+        <div class="drop-label">${citiCount ? 'Citi loaded' : 'Citi AAdvantage'}</div>
+        <div class="drop-sub">${citiCount ? '' : 'Drop PDF here or click to browse'}</div>
+        <div class="drop-status">${citiCount ? citiCount + ' transactions' : ''}</div>
+      </div>
     </div>
-    <div id="tab-amex" style="${activeTab!=='amex'?'display:none':''}">
-      <label>AMEX Statement Text</label>
-      <textarea id="amex-text" placeholder="Paste your AMEX PDF text here...">${escHtml(S.amexText)}</textarea>
-      ${amexCount ? `<div class="parse-status parse-ok">✓ ${amexCount} transactions detected</div>` : S.amexText ? '<div class="parse-status parse-warn">⚠ No transactions detected</div>' : ''}
-    </div>
-    <div id="tab-citi" style="${activeTab!=='citi'?'display:none':''}">
-      <label>Citi AAdvantage Statement Text</label>
-      <textarea id="citi-text" placeholder="Paste your Citi PDF text here...">${escHtml(S.citiText)}</textarea>
-      ${citiCount ? `<div class="parse-status parse-ok">✓ ${citiCount} transactions detected</div>` : S.citiText ? '<div class="parse-status parse-warn">⚠ No transactions detected</div>' : ''}
-    </div>
+    ${(amexCount + citiCount) > 0 ? `<div class="parse-status parse-ok">✓ ${amexCount + citiCount} total transactions ready to review</div>` : `
+    <div style="background:var(--bg);border-radius:8px;padding:12px;font-size:12px;color:var(--muted);">
+      Upload at least one statement to continue. You can do both or just one.
+    </div>`}
   </div>
   <div class="btn-row">
     <button class="btn btn-secondary" onclick="goPhase('setup')">← Back</button>
-    <button class="btn btn-primary" onclick="startReview()">Parse & Start Review →</button>
+    <button class="btn btn-primary" onclick="startReview()" ${(amexCount+citiCount)===0?'disabled style="opacity:0.5;cursor:not-allowed;"':''}>
+      Review ${amexCount+citiCount} Transactions →
+    </button>
   </div>`;
 }
 
-function setTab(t) {
-  activeTab = t;
-  const at = document.getElementById('amex-text');
-  const ct = document.getElementById('citi-text');
-  if (at) S.amexText = at.value;
-  if (ct) S.citiText = ct.value;
-  render();
-}
-
 function startReview() {
-  S.amexText = document.getElementById('amex-text')?.value || S.amexText;
-  S.citiText = document.getElementById('citi-text')?.value || S.citiText;
   const amexTxns = S.amexText ? parseAMEX(S.amexText) : [];
   const citiTxns = S.citiText ? parseCiti(S.citiText) : [];
   S.transactions = [...amexTxns, ...citiTxns].map((t,i) => ({...t, id:i}));
   S.preloaded = false;
-  if (S.transactions.length === 0) { alert('No transactions found. Make sure you pasted the full PDF text.'); return; }
+  if (S.transactions.length === 0) { alert('No transactions found.'); return; }
   S.current = 0;
   goPhase('review');
 }
